@@ -15,153 +15,183 @@
  */
 package dev.morling.onebrc;
 
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.TreeMap;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 public class CalculateAverage_sudhirtumati {
 
     private static final String FILE = "./measurements.txt";
-
+    private static final int bufferSize = 8192;
+    private static final byte SEMICOLON = (byte) ';';
+    private static final byte NEW_LINE = (byte) '\n';
     private static final int THREAD_COUNT = Runtime.getRuntime().availableProcessors();
+    private static final Semaphore PERMITS = new Semaphore(THREAD_COUNT);
+    private static final MeasurementAggregator globalAggregator = new MeasurementAggregator();
+    private static final Semaphore AGGREGATOR_PERMITS = new Semaphore(1);
+    //private static final Map<FcPosKey, FcPosValue> FC_POS_MAP = new HashMap<>();
+    /*private static final FileOutputStream fos;
 
-    private final BlockingQueue<Runnable> queue = new LinkedBlockingQueue<>(100);
-
-    private final ThreadPoolExecutor executor = new ThreadPoolExecutor(THREAD_COUNT, THREAD_COUNT, 100L, TimeUnit.MILLISECONDS, queue);
+    static {
+        try {
+            fos = new FileOutputStream("output.txt");
+        } catch (FileNotFoundException e) {
+            throw new RuntimeException(e);
+        }
+    }*/
 
     public static void main(String[] args) throws IOException, InterruptedException {
         CalculateAverage_sudhirtumati instance = new CalculateAverage_sudhirtumati();
-        instance.process();
-        System.out.println(MeasurementAggregator.getInstance().getResult());
+        //try(fos) {
+            instance.chunkProcess();
+        //}
     }
 
-    private void process() throws IOException, InterruptedException {
-        int bufferSize = 8192 * 128;
-        MeasurementAggregator aggregator = MeasurementAggregator.getInstance();
-        executor.prestartAllCoreThreads();
-        try (RandomAccessFile raf = new RandomAccessFile(FILE, "r");
-                FileChannel fc = raf.getChannel()) {
-            ByteBuffer buffer = ByteBuffer.allocate(bufferSize);
-            ByteBuffer leftoverBuf = ByteBuffer.allocate(0);
-            while (fc.read(buffer) > 0) {
-                buffer.flip();
-                ByteBuffer resultBuf = ByteBuffer.allocate(leftoverBuf.capacity() + buffer.limit()).put(leftoverBuf).put(buffer);
-                int endIndex = findIndexOfValidEnd(resultBuf);
-                ByteBuffer toProcessBuf = resultBuf.slice(0, endIndex);
-                queue.offer(new BufferChunkProcessor(deepCopy(toProcessBuf), aggregator), 10, TimeUnit.SECONDS);
-                resultBuf.position(0);
-                endIndex++;
-                leftoverBuf = resultBuf.slice(endIndex, resultBuf.limit() - endIndex);
-                buffer.clear();
-            }
-        }
-        executor.shutdown();
-        try {
-            if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
-                executor.shutdownNow();
-            }
-        }
-        catch (InterruptedException e) {
-            executor.shutdownNow();
+    static record FcPosKey(int index, String tId) implements Comparable<FcPosKey> {
+        @Override
+        public int compareTo(FcPosKey other) {
+            return Objects.compare(this, other, Comparator.comparing(FcPosKey::index).thenComparing(FcPosKey::tId));
         }
     }
 
-    private ByteBuffer deepCopy(ByteBuffer original) {
-        int pos = original.position();
-        int lim = original.limit();
-        try {
-            original.position(0).limit(original.capacity());
-            ByteBuffer copy = doDeepCopy(original);
-            copy.position(pos).limit(lim);
-            return copy;
-        }
-        finally {
-            original.position(pos).limit(lim);
-        }
+    static record FcPosValue(long start, long end) {
     }
 
-    private ByteBuffer doDeepCopy(ByteBuffer original) {
-        int pos = original.position();
-        try {
-            ByteBuffer copy = ByteBuffer.allocate(original.remaining());
-            copy.put(original);
-            copy.order(original.order());
-            return copy.position(0);
+    private void chunkProcess() throws InterruptedException {
+        //Collection<Thread> threads = new ArrayList<>();
+        for (int i = 0; i < THREAD_COUNT; i++) {
+            PERMITS.acquire();
+            Thread t = new ChunkProcessingThread(i);
+            t.setName(STR."T\{i}");
+            t.start();
         }
-        finally {
-            original.position(pos);
+        while (PERMITS.availablePermits() != THREAD_COUNT) {
+            Thread.sleep(100);
         }
+        System.out.println(globalAggregator.getResult());
+        //TreeMap<FcPosKey, FcPosValue> tm = new TreeMap<>(FC_POS_MAP);
+        //System.out.println(tm);
     }
 
-    int findIndexOfValidEnd(ByteBuffer buffer) {
-        int endIndex = -1;
-        int pos = buffer.limit() - 1;
-        while (endIndex == -1 && pos > -1) {
-            if ((char) buffer.get(pos) == '\n') {
-                endIndex = pos;
-            }
-            pos--;
-        }
-        return endIndex;
-    }
+    static class ChunkProcessingThread extends Thread {
 
-    static final class BufferChunkProcessor implements Runnable {
+        private int index;
+        private final MeasurementAggregator aggregator;
 
-        private static final byte SEMICOLON = (byte) ';';
-        private static final byte NEW_LINE = (byte) '\n';
-        private final ByteBuffer buffer;
-        private final MeasurementAggregator measurementAggregator;
-
-        BufferChunkProcessor(ByteBuffer buffer, MeasurementAggregator measurementAggregator) {
-            this.buffer = buffer;
-            this.measurementAggregator = measurementAggregator;
+        ChunkProcessingThread(int index) {
+            this.index = index;
+            aggregator = new MeasurementAggregator();
         }
 
         @Override
         public void run() {
-            int mStartMark = 0;
+            try (FileInputStream is = new FileInputStream(FILE);
+                 FileChannel fc = is.getChannel()) {
+                ByteBuffer buffer = ByteBuffer.allocate(bufferSize);
+                fc.position(index == 0 ? 0 : (((long) index * bufferSize) - 50));
+                int lc = 1;
+                while (fc.read(buffer) != -1) {
+                    //System.out.println(fc.position());
+                    buffer.flip();
+                    printBuffer("BEFORE ADJUSTING", buffer);
+                    if (fc.position() != bufferSize) {
+                        seekStartPos(buffer);
+                    }
+                    //printBuffer(" AFTER ADJUSTING", buffer);
+                    processBuffer(buffer);
+                    //System.out.println(STR."\{Thread.currentThread().getName()}::\{index}::\{fcPos}::\{newFcPos}");
+                    //FC_POS_MAP.put(new FcPosKey(index, Thread.currentThread().getName()), new FcPosValue(fc.position() - buffer.limit(), fc.position()));
+                    index += THREAD_COUNT;
+                    fc.position(((long) index * bufferSize) - (lc * 50L));
+                    buffer.position(0);
+                    lc++;
+                }
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+            try {
+                AGGREGATOR_PERMITS.acquire();
+                globalAggregator.process(aggregator);
+                AGGREGATOR_PERMITS.release();
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+            PERMITS.release();
+        }
+
+        private void processBuffer(ByteBuffer buffer) throws IOException {
+            int mStartMark = buffer.position();
             int tStartMark = -1;
-            buffer.position(0);
-            int count = 0;
+            int count = buffer.position();
             do {
                 byte b = buffer.get(count);
                 if (b == SEMICOLON) {
                     tStartMark = count;
-                }
-                else if (b == NEW_LINE || count == buffer.limit() - 1) {
+                } else if (b == NEW_LINE) {
                     byte[] locArr = new byte[tStartMark - mStartMark];
                     byte[] tempArr = new byte[count - tStartMark];
                     buffer.get(mStartMark, locArr);
                     buffer.get(mStartMark + locArr.length + 1, tempArr);
-                    measurementAggregator.process(locArr, tempArr);
+                    aggregator.process(locArr, tempArr);
                     mStartMark = count + 1;
                 }
                 count++;
             } while (count < buffer.limit());
         }
+
+        private void printBuffer(String prefix, ByteBuffer buffer) {
+            byte[] arr = new byte[buffer.limit() - buffer.position()];
+            buffer.get(buffer.position(), arr);
+            String str = new String(arr);
+            str = str.replace('\n', ':');
+            System.out.println(STR."\{prefix}:: \{Thread.currentThread().getName()}:: \{str}");
+        }
+
+        private void seekStartPos(ByteBuffer buffer) {
+            for (int i = 49; i >= 0; i--) {
+                if (buffer.get(i) == NEW_LINE) {
+                    buffer.position(i + 1);
+                    break;
+                }
+            }
+        }
     }
 
     static final class MeasurementAggregator {
-        private static final MeasurementAggregator instance = new MeasurementAggregator();
         private static final long MAX_VALUE_DIVIDE_10 = Long.MAX_VALUE / 10;
-        private final Map<String, Measurement> store = new ConcurrentHashMap<>();
+        private final Map<String, Measurement> store = new HashMap<>();
 
-        private MeasurementAggregator() {
+        public void process(MeasurementAggregator other) {
+            other.store.forEach((k, v) -> {
+                Measurement m = store.get(k);
+                if (m == null) {
+                    m = new Measurement();
+                    store.put(k, m);
+                }
+                m.process(v);
+            });
         }
 
-        public static MeasurementAggregator getInstance() {
-            return instance;
-        }
-
-        public void process(byte[] location, byte[] temperature) {
+        public void process(byte[] location, byte[] temperature) throws IOException {
             String loc = new String(location);
             Measurement measurement = store.get(loc);
             if (measurement == null) {
@@ -170,6 +200,8 @@ public class CalculateAverage_sudhirtumati {
             }
             double tempD = parseDouble(temperature);
             measurement.process(tempD);
+            //System.out.print(STR."\{loc};\{tempD}::");
+            //fos.write(STR."\{loc};\{tempD}\n".getBytes());
         }
 
         public double parseDouble(byte[] bytes) {
@@ -192,14 +224,12 @@ public class CalculateAverage_sudhirtumati {
                     value = value * 10 + (ch - '0');
                     decimalPlaces++;
 
-                }
-                else if (ch == '.') {
+                } else if (ch == '.') {
                     decimalPlaces = 0;
                 }
                 if (index == bytes.length - 1) {
                     break;
-                }
-                else {
+                } else {
                     ch = bytes[++index];
                 }
             }
@@ -285,6 +315,17 @@ public class CalculateAverage_sudhirtumati {
             count++;
         }
 
+        public void process(Measurement other) {
+            if (other.min < min) {
+                this.min = other.min;
+            }
+            if (other.max > max) {
+                this.max = other.max;
+            }
+            this.sum += other.sum;
+            this.count += other.count;
+        }
+
         public String toString() {
             ResultRow result = new ResultRow(min, sum, count, max);
             return result.toString();
@@ -294,7 +335,7 @@ public class CalculateAverage_sudhirtumati {
     private record ResultRow(double min, double sum, double count, double max) {
 
         public String toString() {
-            return round(min) + "/" + round((Math.round(sum * 10.0) / 10.0) / count) + "/" + round(max);
+            return STR."\{round(min)}/\{round(sum)}/\{round(count)}/\{round((Math.round(sum * 10.0) / 10.0) / count)}/\{round(max)}";
         }
 
         private double round(double value) {
